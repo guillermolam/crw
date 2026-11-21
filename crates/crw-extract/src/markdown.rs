@@ -1,13 +1,16 @@
+use lol_html::html_content::EndTag;
+use lol_html::{HandlerResult, HtmlRewriter, Settings, element};
 use regex::Regex;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::rc::Rc;
 use std::sync::LazyLock;
 
 /// Convert HTML to Markdown using htmd (turndown.js-inspired converter).
 ///
-/// Thin wrapper over [`html_to_markdown_with`] with `normalize = false` ,
-/// byte-identical to this function's historical behavior. Existing callers
-/// never need to change to pick up table normalization.
+/// Thin wrapper over [`html_to_markdown_with`] without table normalization.
 pub fn html_to_markdown(html: &str) -> String {
     html_to_markdown_with(html, false)
 }
@@ -25,7 +28,7 @@ pub fn html_to_markdown_with(html: &str, normalize: bool) -> String {
     } else {
         html.to_string()
     };
-    let md = htmd::convert(&html).unwrap_or_default();
+    let md = htmd::convert(&wrap_bare_pre(&html)).unwrap_or_default();
     let md = strip_anchor_artifacts(&md);
     let md = strip_data_uris(&md);
     if normalize {
@@ -33,6 +36,76 @@ pub fn html_to_markdown_with(html: &str, normalize: bool) -> String {
     } else {
         convert_indented_code_to_fenced(&md)
     }
+}
+
+// htmd only fences a <code> directly inside <pre>.
+fn wrap_bare_pre(html: &str) -> Cow<'_, str> {
+    if !html.match_indices('<').any(|(i, _)| {
+        html.as_bytes()
+            .get(i + 1..i + 4)
+            .is_some_and(|tag| tag.eq_ignore_ascii_case(b"pre"))
+    }) {
+        return Cow::Borrowed(html);
+    }
+    let active = Rc::new(Cell::new(None));
+    let insertions = Rc::new(RefCell::new(Vec::new()));
+    let open_pre = Rc::clone(&active);
+    let closed_pre = Rc::clone(&insertions);
+    let settings = Settings::new()
+        .append_element_content_handler(element!("pre", move |el| {
+            let start = el.source_location().bytes().end;
+            // The HTML parser discards the first newline immediately inside <pre>.
+            let newline = match html.as_bytes().get(start..) {
+                Some([b'\r', b'\n', ..]) => 2,
+                Some([b'\r' | b'\n', ..]) => 1,
+                _ => 0,
+            };
+            let previous = open_pre.replace(Some(start + newline));
+            let open_pre = Rc::clone(&open_pre);
+            let closed_pre = Rc::clone(&closed_pre);
+            let end_handler: Box<dyn FnOnce(&mut EndTag<'_>) -> HandlerResult> =
+                Box::new(move |end| {
+                    if let Some(start) = open_pre.replace(previous) {
+                        let end = end.source_location().bytes().start;
+                        if start < end {
+                            closed_pre
+                                .borrow_mut()
+                                .extend([(start, "<code>"), (end, "</code>")]);
+                        }
+                    }
+                    Ok(())
+                });
+            el.on_end_tag(end_handler)
+        }))
+        .append_element_content_handler(element!("pre > code", move |_| {
+            active.set(None);
+            Ok(())
+        }));
+    let mut rewriter = HtmlRewriter::new(settings, |_: &[u8]| ());
+    if rewriter
+        .write(html.as_bytes())
+        .and_then(|()| rewriter.end())
+        .is_err()
+    {
+        return Cow::Borrowed(html);
+    }
+    let mut insertions = insertions.borrow_mut();
+    if insertions.is_empty() {
+        return Cow::Borrowed(html);
+    }
+    insertions.sort_unstable_by_key(|&(offset, _)| offset);
+    let mut out = String::with_capacity(html.len() + insertions.len() * 8);
+    let mut start = 0;
+    for &(offset, tag) in insertions.iter() {
+        let Some(segment) = html.get(start..offset) else {
+            return Cow::Borrowed(html);
+        };
+        out.push_str(segment);
+        out.push_str(tag);
+        start = offset;
+    }
+    out.push_str(&html[start..]);
+    Cow::Owned(out)
 }
 
 /// One markdown link or image.
@@ -182,9 +255,8 @@ fn convert_indented_code_to_fenced_table_safe(md: &str) -> String {
 fn convert_indented_code_to_fenced_impl(md: &str, table_safe: bool) -> String {
     let mut result = String::with_capacity(md.len());
     let mut code_lines: Vec<&str> = Vec::new();
-    let mut in_fenced = false;
-    // Whether the last non-blank line before the current indented run was a
-    // list item. Only then can the run be list continuation rather than code.
+    let mut fence_len = 0;
+    // An indented run can continue the last list item, even after its fenced code.
     let mut after_list_item = false;
     let mut run_continues_list = false;
 
@@ -196,19 +268,22 @@ fn convert_indented_code_to_fenced_impl(md: &str, table_safe: bool) -> String {
     };
 
     for (idx, line) in lines.iter().copied().enumerate() {
-        // Track existing fenced code blocks to avoid double-fencing.
-        if line.trim_start().starts_with("```") {
-            in_fenced = !in_fenced;
+        let trimmed = line.trim_start();
+        let backticks = trimmed.bytes().take_while(|&byte| byte == b'`').count();
+        if (fence_len == 0 && backticks >= 3)
+            || (fence_len > 0 && backticks >= fence_len && trimmed[backticks..].trim().is_empty())
+        {
+            fence_len = if fence_len == 0 { backticks } else { 0 };
             if !code_lines.is_empty() {
                 flush_code_block(&mut result, &mut code_lines, run_continues_list);
             }
-            after_list_item = false;
+            after_list_item &= dedent_code_indent(line).is_some();
             result.push_str(line);
             result.push('\n');
             continue;
         }
 
-        if in_fenced {
+        if fence_len > 0 {
             result.push_str(line);
             result.push('\n');
             continue;
@@ -315,18 +390,8 @@ fn indented_table_line_flags(lines: &[&str]) -> Vec<bool> {
 }
 
 fn flush_code_block(result: &mut String, code_lines: &mut Vec<&str>, continues_list: bool) {
-    while code_lines.last() == Some(&"") {
-        code_lines.pop();
-    }
-    if code_lines.is_empty() {
-        return;
-    }
-
-    // An indented run that continues a list and holds list items is a nested
-    // list, not code. Emit it untouched, fencing it would strip the markers and
-    // destroy the list. Both conditions are needed: a genuine code block can
-    // contain a line that looks like a list item, but it will not follow one.
-    if continues_list && code_lines.iter().any(|l| LIST_ITEM_RE.is_match(l)) {
+    // The list owns this indentation. Let the Markdown parser interpret it within the list.
+    if continues_list {
         for line in code_lines.iter() {
             result.push_str(line);
             result.push('\n');
@@ -335,6 +400,12 @@ fn flush_code_block(result: &mut String, code_lines: &mut Vec<&str>, continues_l
         return;
     }
 
+    while code_lines.last() == Some(&"") {
+        code_lines.pop();
+    }
+    if code_lines.is_empty() {
+        return;
+    }
     result.push_str("```\n");
     for line in code_lines.iter() {
         let stripped = line
