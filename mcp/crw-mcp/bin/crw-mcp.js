@@ -260,6 +260,9 @@ if (require.main === module) {
   resolveBinary()
   .then((bin) => {
     const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+    if (result.error) {
+      console.error(`crw-mcp: could not start the native binary: ${result.error.message}`);
+    }
     process.exit(result.status ?? 1);
   })
   .catch((err) => {
