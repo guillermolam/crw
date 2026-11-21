@@ -1,4 +1,4 @@
-use crw_extract::markdown::html_to_markdown;
+use crw_extract::markdown::{html_to_markdown, html_to_markdown_with};
 
 #[test]
 fn markdown_empty_input() {
@@ -63,4 +63,32 @@ fn markdown_strips_data_uri_images() {
     );
     assert!(md.contains("Before"));
     assert!(md.contains("After"));
+}
+
+#[test]
+fn markdown_preserves_preformatted_examples() {
+    let html = "<p>Example:</p><pre>\n<span>&gt;&gt;&gt; </span><span>len([1, 2])</span>\n2\n</pre>\
+                <pre>```\n    plain text\n```</pre>\
+                <pre><code class=\"language-rust\">fn main() {}\n</code></pre><p>After.</p>";
+    for normalize_tables in [false, true] {
+        let md = html_to_markdown_with(html, normalize_tables);
+        assert!(
+            md.contains("Example:\n\n```\n>>> len([1, 2])\n2\n```"),
+            "{md}"
+        );
+        assert!(md.contains("````\n```\n    plain text\n```\n````"), "{md}");
+        assert!(md.contains("```rust\nfn main() {}\n```\n\nAfter."), "{md}");
+    }
+}
+
+#[test]
+fn markdown_preserves_prose_between_code_blocks_in_a_list() {
+    let html = "<ol><li><p>First example:</p><pre><span>first()</span></pre>\
+                <p>Next example:</p><pre><span>second()</span></pre></li></ol>";
+    let expected =
+        "    ```\n    first()\n    ```\n\n    Next example:\n\n    ```\n    second()\n    ```";
+    for normalize_tables in [false, true] {
+        let md = html_to_markdown_with(html, normalize_tables);
+        assert!(md.contains(expected), "{md}");
+    }
 }
